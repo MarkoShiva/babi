@@ -1,12 +1,16 @@
 import argparse
 import curses
+import os.path
 from typing import Optional
 from typing import Sequence
 
 from babi.file import File
+from babi.highlight import load_grammars
+from babi.highlight import Theme
 from babi.screen import EditResult
 from babi.screen import make_stdscr
 from babi.screen import Screen
+from babi.user_data import xdg_config
 
 
 def _edit(screen: Screen) -> EditResult:
@@ -30,8 +34,17 @@ def _edit(screen: Screen) -> EditResult:
             screen.status.update(f'unknown key: {key}')
 
 
-def c_main(stdscr: 'curses._CursesWindow', args: argparse.Namespace) -> None:
-    screen = Screen(stdscr, [File(f) for f in args.filenames or [None]])
+def c_main(
+        stdscr: 'curses._CursesWindow',
+        theme: Theme,
+        args: argparse.Namespace,
+) -> None:
+    grammars = load_grammars()
+    screen = Screen(
+        stdscr,
+        [File(f, grammars) for f in args.filenames or [None]],
+        theme,
+    )
     with screen.perf.log(args.perf_log), screen.history.save():
         while screen.files:
             screen.i = screen.i % len(screen.files)
@@ -54,8 +67,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument('filenames', metavar='filename', nargs='*')
     parser.add_argument('--perf-log')
     args = parser.parse_args(argv)
-    with make_stdscr() as stdscr:
-        c_main(stdscr, args)
+
+    theme_filename = xdg_config('theme.json')
+    if os.path.exists(theme_filename):
+        theme = Theme.parse(theme_filename)
+    else:
+        theme = Theme.blank()
+
+    with make_stdscr(theme) as stdscr:
+        c_main(stdscr, theme, args)
     return 0
 
 

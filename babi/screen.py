@@ -18,6 +18,7 @@ from typing import Union
 from babi.file import Action
 from babi.file import File
 from babi.file import get_lines
+from babi.highlight import Theme
 from babi.history import History
 from babi.margin import Margin
 from babi.perf import Perf
@@ -67,9 +68,11 @@ class Screen:
             self,
             stdscr: 'curses._CursesWindow',
             files: List[File],
+            theme: Theme,
     ) -> None:
         self.stdscr = stdscr
         self.files = files
+        self.theme = theme
         self.i = 0
         self.history = History()
         self.perf = Perf()
@@ -137,7 +140,7 @@ class Screen:
     def draw(self) -> None:
         if self.margin.header:
             self._draw_header()
-        self.file.draw(self.stdscr, self.margin)
+        self.file.draw(self, self.margin)
         self.status.draw(self.stdscr, self.margin)
 
     @contextlib.contextmanager
@@ -376,7 +379,7 @@ class Screen:
     def background(self) -> None:
         curses.endwin()
         os.kill(os.getpid(), signal.SIGSTOP)
-        self.stdscr = _init_screen()
+        self.stdscr = _init_screen(self.theme)
         self.resize()
 
     DISPATCH = {
@@ -399,7 +402,7 @@ class Screen:
     }
 
 
-def _init_screen() -> 'curses._CursesWindow':
+def _init_screen(theme: Theme) -> 'curses._CursesWindow':
     # set the escape delay so curses does not pause waiting for sequences
     if sys.version_info >= (3, 9):  # pragma: no cover
         curses.set_escdelay(25)
@@ -416,14 +419,19 @@ def _init_screen() -> 'curses._CursesWindow':
     stdscr.keypad(True)
     with contextlib.suppress(curses.error):
         curses.start_color()
-    # TODO: colors
+        colors, pairs = theme.color_mappings()
+        for color, n in colors.items():
+            curses.init_color(n, *color.as_curses())
+        for (fg, bg), n in pairs.items():
+            if n != 0:
+                curses.init_pair(n, colors[bg], colors[fg])
     return stdscr
 
 
 @contextlib.contextmanager
-def make_stdscr() -> Generator['curses._CursesWindow', None, None]:
+def make_stdscr(theme: Theme) -> Generator['curses._CursesWindow', None, None]:
     """essentially `curses.wrapper` but split out to implement ^Z"""
-    stdscr = _init_screen()
+    stdscr = _init_screen(theme)
     try:
         yield stdscr
     finally:

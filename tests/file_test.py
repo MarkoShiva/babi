@@ -7,7 +7,7 @@ from babi.file import get_lines
 
 
 def test_position_repr():
-    ret = repr(File('f.txt'))
+    ret = repr(File('f.txt', {}))
     assert ret == (
         'File(\n'
         "    filename='f.txt',\n"

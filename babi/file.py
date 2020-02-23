@@ -9,6 +9,7 @@ import os.path
 from typing import Any
 from typing import Callable
 from typing import cast
+from typing import Dict
 from typing import Generator
 from typing import IO
 from typing import List
@@ -21,6 +22,13 @@ from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
 
+from babi.highlight import CursesRegion
+from babi.highlight import CursesRegions
+from babi.highlight import Grammar
+from babi.highlight import highlight_line
+from babi.highlight import make_entry
+from babi.highlight import State
+from babi.highlight import Theme
 from babi.horizontal_scrolling import line_x
 from babi.horizontal_scrolling import scrolled_line
 from babi.list_spy import ListSpy
@@ -96,6 +104,7 @@ class Action:
         file.x = self.start_x
         file.y = self.start_y
         file.modified = self.start_modified
+        file.touch(spy.min_line_touched)
 
         return action
 
@@ -202,7 +211,11 @@ class _SearchIter:
 
 
 class File:
-    def __init__(self, filename: Optional[str]) -> None:
+    def __init__(
+            self,
+            filename: Optional[str],
+            grammars: Dict[str, Grammar],
+    ) -> None:
         self.filename = filename
         self.modified = False
         self.lines: MutableSequenceNoSlice = []
@@ -212,6 +225,23 @@ class File:
         self.undo_stack: List[Action] = []
         self.redo_stack: List[Action] = []
         self.select_start: Optional[Tuple[int, int]] = None
+        self._grammars = grammars
+        self._grammar = grammars['source.unknown']
+        self._hl_initial_state = self._make_hl_initial_state()
+        self._hl_states: List[Tuple[State, CursesRegions]] = []
+        # XXX: I wanted this to be a WeakKeyDictionary :/
+        self._hl_cache: Dict[str, Dict[State, Tuple[State, CursesRegions]]]
+        self._hl_cache = {}
+
+    def _make_hl_initial_state(self) -> State:
+        entry = make_entry(
+            self._grammar,
+            self._grammar.patterns,
+            '$ ',
+            (),
+            (self._grammar.scope_name,),
+        )
+        return (entry,)
 
     def ensure_loaded(self, status: Status) -> None:
         if self.lines:
@@ -233,6 +263,13 @@ class File:
         if mixed:
             status.update(f'mixed newlines will be converted to {self.nl!r}')
             self.modified = True
+
+        if self.filename is not None:
+            for grammar in self._grammars.values():
+                if grammar.matches_file(self.filename, self.lines[0] + '\n'):
+                    self._grammar = grammar
+                    self._hl_initial_state = self._make_hl_initial_state()
+                    break
 
     def __repr__(self) -> str:
         attrs = ',\n    '.join(f'{k}={v!r}' for k, v in self.__dict__.items())
@@ -757,6 +794,7 @@ class File:
             if continue_last:
                 self.undo_stack[-1].end_x = self.x
                 self.undo_stack[-1].end_y = self.y
+                self.touch(spy.min_line_touched)
             elif spy.has_modifications:
                 self.modified = True
                 action = Action(
@@ -768,6 +806,7 @@ class File:
                     final=final,
                 )
                 self.undo_stack.append(action)
+                self.touch(spy.min_line_touched)
 
     @contextlib.contextmanager
     def select(self) -> Generator[None, None, None]:
@@ -803,41 +842,93 @@ class File:
         else:
             return self.select_start, select_end
 
-    def draw(self, stdscr: 'curses._CursesWindow', margin: Margin) -> None:
+    # highlighting
+
+    def touch(self, lineno: int) -> None:
+        """Called when a particular line is modified"""
+        del self._hl_states[lineno:]
+
+    def _hl_line(
+            self,
+            theme: Theme,
+            state: State,
+            line: str,
+    ) -> Tuple[State, Tuple[CursesRegion, ...]]:
+        try:
+            return self._hl_cache[line][state]
+        except KeyError:
+            pass
+
+        new_state, raw_regs = highlight_line(state, f'{line}\n')
+        regs: List[CursesRegion] = []
+        for r in raw_regs:
+            style = theme.select(r.scope)
+            if style == theme.default:
+                continue
+
+            attr = theme.attr(style)
+            if regs and regs[-1].end == r.start and regs[-1].color == attr:
+                n = regs[-1].n + r.end - r.start
+                regs[-1] = regs[-1]._replace(n=n)
+            else:
+                regs.append(CursesRegion(r.start, r.end - r.start, attr))
+
+        dct = self._hl_cache.setdefault(line, {})
+        ret = dct[state] = (new_state, tuple(regs))
+        return ret
+
+    def draw(self, screen: 'Screen', margin: Margin) -> None:
         to_display = min(len(self.lines) - self.file_y, margin.body_lines)
         for i in range(to_display):
             line_idx = self.file_y + i
             line = self.lines[line_idx]
             x = self.x if line_idx == self.y else 0
             line = scrolled_line(line, x, curses.COLS)
-            stdscr.insstr(i + margin.header, 0, line)
+            screen.stdscr.insstr(i + margin.header, 0, line)
         blankline = ' ' * curses.COLS
         for i in range(to_display, margin.body_lines):
-            stdscr.insstr(i + margin.header, 0, blankline)
+            screen.stdscr.insstr(i + margin.header, 0, blankline)
+
+        if not self._hl_states:
+            state = self._hl_initial_state
+        else:
+            state, _ = self._hl_states[-1]
+
+        for i in range(len(self._hl_states), self.file_y + to_display):
+            state, hl = self._hl_line(screen.theme, state, self.lines[i])
+            self._hl_states.append((state, hl))
+
+        for i in range(self.file_y, self.file_y + to_display):
+            _, regions = self._hl_states[i]
+            for region in regions:
+                self.highlight(
+                    screen.stdscr, margin,
+                    y=i, include_edge=False, **region._asdict(),
+                )
 
         if self.select_start is not None:
             (s_y, s_x), (e_y, e_x) = self._get_selection()
 
             if s_y == e_y:
                 self.highlight(
-                    stdscr, margin,
+                    screen.stdscr, margin,
                     y=s_y, x=s_x, n=e_x - s_x,
                     color=HIGHLIGHT, include_edge=True,
                 )
             else:
                 self.highlight(
-                    stdscr, margin,
+                    screen.stdscr, margin,
                     y=s_y, x=s_x, n=len(self.lines[s_y]) - s_x + 1,
                     color=HIGHLIGHT, include_edge=True,
                 )
                 for l_y in range(s_y + 1, e_y):
                     self.highlight(
-                        stdscr, margin,
+                        screen.stdscr, margin,
                         y=l_y, x=0, n=len(self.lines[l_y]) + 1,
                         color=HIGHLIGHT, include_edge=True,
                     )
                 self.highlight(
-                    stdscr, margin,
+                    screen.stdscr, margin,
                     y=e_y, x=0, n=e_x,
                     color=HIGHLIGHT, include_edge=True,
                 )
@@ -852,6 +943,7 @@ class File:
         h_y = y - self.file_y + margin.header
         if y == self.y:
             l_x = line_x(self.x, curses.COLS)
+            # TODO: include edge left detection
             if x < l_x:
                 h_x = 0
                 n -= l_x - x
@@ -861,7 +953,7 @@ class File:
             l_x = 0
             h_x = x
         if not include_edge and len(self.lines[y]) > l_x + curses.COLS:
-            raise NotImplementedError('h_n = min(curses.COLS - h_x - 1, n)')
+            h_n = min(curses.COLS - h_x - 1, n)
         else:
             h_n = n
         if (
